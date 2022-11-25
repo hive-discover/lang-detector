@@ -13,4 +13,6 @@ RUN pip3 install -r requirements.txt
 RUN python3 -m spacy download en_core_web_sm
 
 COPY . .
-CMD ["python3", "-u", "entrypoint.py"]
+ENTRYPOINT ["python3"]
+CMD ["-u", "entrypoint.py"]
+# registry.hive-discover.tech/lang-detector:0.2.1

@@ -1,61 +1,18 @@
+import os
 import time
-from config import *
-from detector import TextLangs, get_post_text
 import requests
+from random import choice, randint
+from pymongo import MongoClient, UpdateOne
 
-BATCH_SIZE = 25
-TOTAL_POSTS_FOUND = 0 # Amount of posts which are got no lang detection (setted by get_raw_posts)
-WORKER_FIND_QUERY = {
-        "size" : str(BATCH_SIZE),
-        "query" : {
-            "bool" : {
-                "must" : [
-                    {"exists" : {"field" : "text_title"}},
-                    {"exists" : {"field" : "text_body"}},
-                
-                    {"nested" : {
-                        "path" : "jobs",
-                        "query" : {
-                            "bool" : {
-                                "must_not" : [
-                                    {"term" : {"jobs.lang_detected" : True}},                          
-                                ],                       
-                            }
-                        }
-                    }}
-                ]
-            }
-        },
-        "_source" : {
-            "includes" : ["text_title", "text_body"]
-        }
-    }
+from detector import TextLangs, get_post_text
 
-os_client = get_opensearch_client()
+# Get MongoDB Client
+mongo_client = MongoClient(os.environ.get("MONGO_URI", None))
 
+HEARTBEAT_URL = os.environ.get("HEARTBEAT_URL", None)
+BATCH_SIZE = os.environ.get("BATCH_SIZE", 25)
 
-def get_raw_posts() -> list:
-    '''Get Posts from OpenSearch'''
-    global TOTAL_POSTS_FOUND
-    search = os_client.search(index="hive-posts", body=WORKER_FIND_QUERY, timeout="60s")
-    TOTAL_POSTS_FOUND = search["hits"]["total"]["value"]
-    return search["hits"]["hits"]
-
-def work_on_batch() -> int:
-    '''Work on a batch of posts and return the number of processed posts'''
-    # Detect langs for each hit and add the result to the bulk-update
-    bulk_obj = [] 
-    for hit in get_raw_posts():
-        text_lang = TextLangs(get_post_text(hit["_source"]))
-        bulk_obj.append({"update" : {"_index": hit["_index"], "_id" : hit["_id"]}})
-        bulk_obj.append({"doc" : {"language" : text_lang.get_detected_langs(), "jobs" : {"lang_detected" : True}}})
-    
-    # Send Bulk Request
-    if len(bulk_obj) > 0:
-        res = os_client.bulk(body=bulk_obj, refresh="wait_for", timeout="60s")
-        return len(res["items"])
-
-    return 0
+total_posts_found = 0
 
 def send_heartbeat(elapsed_time : int = 0) -> None:
     params = {'msg': 'OK', 'ping' : elapsed_time}
@@ -66,20 +23,65 @@ def send_heartbeat(elapsed_time : int = 0) -> None:
         except Exception as e:
             print("Error sending heartbeat: {}".format(e))
 
+def get_posts_to_process(target : str) -> list:
+    '''Get Comments/Replies from MongoDB'''
+    cursor = mongo_client.hive[target].find(
+        {
+            "jobs.lang_detected" : {"$ne" : True},
+        }, 
+        {"title" : 1, "body" : 1, "_id" : 1}
+    )
+
+    global total_posts_found
+    if total_posts_found > (BATCH_SIZE * 4):
+        cursor.skip(randint(0, total_posts_found - (BATCH_SIZE)))
+    cursor.limit(BATCH_SIZE)
+
+    total_posts_found = cursor.count()
+
+    return list(cursor)
+
+def do_work() -> int:
+    # Get Posts to work on
+    target = choice(["comments", "replies"])
+    posts = get_posts_to_process(target)
+
+    # Detect langs for each hit and add the result to the bulk-update
+    bulk_updates = []
+    for post in posts:
+        text_lang = TextLangs(get_post_text(post))
+        bulk_updates.append(UpdateOne(
+            {"_id" : post["_id"]},
+            {"$set" : {"jobs.lang_detected" : True, "language" : text_lang.get_detected_langs()}}
+        ))
+
+    # Send Bulk Request
+    if len(bulk_updates) > 0:
+        res = mongo_client.hive[target].bulk_write(bulk_updates, ordered=False)
+        return res.modified_count, target
+
+    return 0, target
+
+
 def run():
+    global total_posts_found
     while True:
         # Work on a batch
         start_time = time.time()
-        counter = work_on_batch()
+        counter, target = do_work()
         elapsed_time = time.time() - start_time
+        
+        # Logging
         if counter > 0:
-            print("Processed {}/{} posts in {:.2f} seconds".format(counter, TOTAL_POSTS_FOUND, elapsed_time))
-
+            print("Processed {}/{} {} in {:.2f} seconds".format(counter, total_posts_found, target, elapsed_time))
         send_heartbeat(elapsed_time * 1000)  
 
         # Sleep only when we have not to much posts to process
-        if TOTAL_POSTS_FOUND == counter:
-            time.sleep(10)
+        if counter < BATCH_SIZE:
+            time.sleep(5)
+        
+
 
 if __name__ == "__main__":
     run()
+

@@ -96,13 +96,6 @@ class TextLangs:
 
 def get_post_text(post : dict) -> str:
     '''Get post text'''
-    text = ""
-    if "text" in post:
-        text += post["text"] + ". "
-    if "text_title" in post:
-        text += post["text_title"] + ". "
-    if "text_body" in post:
-        text += post["text_body"] + ". "
-
+    text = post.get("title", "") + ". \n " + post.get("body", "") + ". \n " + post.get("text", "")
     return text
 
